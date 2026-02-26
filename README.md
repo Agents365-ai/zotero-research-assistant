@@ -31,14 +31,40 @@ Zotero 7/8 (localhost:23119)
               Top-K results with scores
 ```
 
+## Prerequisites
+
+### System Requirements
+
+| Requirement | Minimum | Recommended |
+|-------------|---------|-------------|
+| RAM | 16GB | 32GB |
+| GPU | - | Apple Silicon / NVIDIA |
+| Storage | 10GB | 50GB+ |
+| Python | 3.10+ | 3.11 |
+
+### Software Dependencies
+
+1. **Zotero 7 or 8** with local API enabled
+   - Download: https://www.zotero.org/download/
+   - Zotero must be running (serves API on `localhost:23119`)
+
+2. **Conda/Mamba** (recommended for environment management)
+   - Miniforge: https://github.com/conda-forge/miniforge
+
+3. **PyTorch** with MPS/CUDA support
+   - Apple Silicon: MPS backend (automatic)
+   - NVIDIA: CUDA toolkit required
+
+### Hugging Face Models (auto-downloaded)
+
+| Model | Size | Purpose |
+|-------|------|---------|
+| `Qwen/Qwen3-Embedding-4B` | ~8GB | Text to vectors |
+| `Qwen/Qwen3-Reranker-4B` | ~8GB | Query-document scoring |
+
+Models download automatically on first run to `~/.cache/huggingface/`.
+
 ## Installation
-
-### Requirements
-
-- Python 3.10+
-- [Zotero 7/8](https://www.zotero.org/) running locally (localhost:23119)
-- ~16GB RAM (for Qwen3 4B models)
-- Apple Silicon / NVIDIA GPU recommended
 
 ### Setup
 
@@ -84,6 +110,18 @@ python workspace.py <command> [options]
 | `delete` | Delete the index |
 
 ### Examples
+
+**Natural language prompts** (when using with AI coding assistant):
+
+```
+"Build the Zotero search index"
+"Search my library for papers about single cell RNA sequencing"
+"Find recent papers on CRISPR gene editing from 2022 onwards"
+"How many papers are indexed?"
+"Sync new papers to the index"
+```
+
+**Direct CLI commands**:
 
 ```bash
 # Build index (first 100 papers for testing)
