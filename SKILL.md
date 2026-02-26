@@ -5,7 +5,7 @@ description: Use when user wants to search Zotero library, query literature meta
 
 # Zotero Research Assistant
 
-Semantic search over your Zotero library using LanceDB + Qwen3 models.
+Semantic search over your Zotero library using LanceDB + local Qwen3 models.
 
 ## Setup
 
@@ -43,26 +43,28 @@ Zotero 7/8 (localhost:23119)
   ├─ Metadata → zotero-query.py
   └─ PDFs → PyMuPDF text extraction
                ↓
-       Qwen3-Embedding-4B (vector)
+       Qwen3-Embedding-0.6B (local)
                ↓
        LanceDB (similarity search)
                ↓
-       Qwen3-Reranker-4B (rerank)
+       Qwen3-Reranker-0.6B (local)
                ↓
        Top-K results with scores
 ```
 
-## Models
+## Models (Local, No External Server)
 
 | Model | Purpose | Size |
 |-------|---------|------|
-| Qwen3-Embedding-4B | Text to vectors | 4B params |
-| Qwen3-Reranker-4B | Score query-doc pairs | 4B params |
+| Qwen/Qwen3-Embedding-0.6B | Text to vectors | ~1.2GB |
+| Qwen/Qwen3-Reranker-0.6B | Score query-doc pairs | ~1.2GB |
+
+Models auto-download on first run. No Ollama or LM Studio required.
 
 ## Performance
 
-- **Build speed**: ~1-2 papers/minute
-- **Search latency**: 2-5 seconds (includes reranking)
+- **Build speed**: ~2-3 papers/minute
+- **Search latency**: 1-3 seconds (includes reranking)
 - **Storage**: ~4MB per paper
 
 ## Storage

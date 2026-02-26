@@ -3,15 +3,18 @@
 ![Claude Code](https://img.shields.io/badge/Claude_Code-compatible-blue)
 ![OpenCode](https://img.shields.io/badge/OpenCode-compatible-green)
 
-Semantic search over your Zotero library using **LanceDB** vector database with **Qwen3** embedding and reranking models.
+Semantic search over your Zotero library using **LanceDB** vector database with **local Qwen3** embedding and reranking models.
+
+**No external servers required** - runs entirely on your local machine.
 
 ## Features
 
 - **Semantic Search** - Find papers by meaning, not just keywords
-- **Neural Reranking** - Qwen3-Reranker-4B improves result relevance
+- **Neural Reranking** - Qwen3-Reranker improves result relevance
 - **Full-Text Indexing** - Extracts and indexes PDF content (first 10 pages)
 - **Year Filtering** - Filter results by publication year
 - **Incremental Sync** - Add new papers without rebuilding entire index
+- **Zero Configuration** - No Ollama/LM Studio setup needed
 
 ## Architecture
 
@@ -20,13 +23,13 @@ Zotero 7/8 (localhost:23119)
   ├─ Metadata API → Paper metadata
   └─ PDF Files → PyMuPDF text extraction
                       ↓
-              Qwen3-Embedding-4B (4B params)
+              Qwen3-Embedding-0.6B (local)
                       ↓
               LanceDB vector storage
                       ↓
               Vector similarity search
                       ↓
-              Qwen3-Reranker-4B (reranking)
+              Qwen3-Reranker-0.6B (local)
                       ↓
               Top-K results with scores
 ```
@@ -37,9 +40,9 @@ Zotero 7/8 (localhost:23119)
 
 | Requirement | Minimum | Recommended |
 |-------------|---------|-------------|
-| RAM | 16GB | 32GB |
+| RAM | 8GB | 16GB |
 | GPU | - | Apple Silicon / NVIDIA |
-| Storage | 10GB | 50GB+ |
+| Storage | 5GB | 20GB+ |
 | Python | 3.10+ | 3.11 |
 
 ### Software Dependencies
@@ -59,8 +62,8 @@ Zotero 7/8 (localhost:23119)
 
 | Model | Size | Purpose |
 |-------|------|---------|
-| `Qwen/Qwen3-Embedding-4B` | ~8GB | Text to vectors |
-| `Qwen/Qwen3-Reranker-4B` | ~8GB | Query-document scoring |
+| `Qwen/Qwen3-Embedding-0.6B` | ~1.2GB | Text to vectors |
+| `Qwen/Qwen3-Reranker-0.6B` | ~1.2GB | Query-document scoring |
 
 Models download automatically on first run to `~/.cache/huggingface/`.
 
@@ -151,10 +154,10 @@ python zotero-query.py collections         # List collections
 
 | Metric | Value |
 |--------|-------|
-| Embedding model | Qwen3-Embedding-4B |
-| Reranker model | Qwen3-Reranker-4B |
-| Build speed | ~1-2 papers/minute |
-| Search latency | 2-5 seconds (includes reranking) |
+| Embedding model | Qwen3-Embedding-0.6B |
+| Reranker model | Qwen3-Reranker-0.6B |
+| Build speed | ~2-3 papers/minute |
+| Search latency | 1-3 seconds (includes reranking) |
 | Storage | ~4MB per paper |
 
 ## Storage

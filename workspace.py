@@ -1,30 +1,145 @@
 #!/usr/bin/env python3
-"""Zotero Research Assistant - LanceDB + Qwen3 Embedding/Reranker.
+"""Zotero Research Assistant - LanceDB + Local Qwen3 Models.
 
 Usage:
-  python workspace.py build [--limit N]   Build index from Zotero PDFs
-  python workspace.py sync                Sync new papers
-  python workspace.py search <query> [-k] Search with reranking
-  python workspace.py status              Show index status
-  python workspace.py delete              Delete index
+  python workspace.py build [--collection NAME]  Build index (all or collection)
+  python workspace.py sync                       Sync new papers
+  python workspace.py search <query> [-k] [--add-to WS]  Search (optionally add to workspace)
+
+  # Workspace commands
+  python workspace.py ws-list                    List workspaces
+  python workspace.py ws-create <name>           Create workspace
+  python workspace.py ws-add <name> <keys>       Add papers to workspace
+  python workspace.py ws-import <name> <coll>    Import collection to workspace
+  python workspace.py ws-search <name> <query>   Search within workspace
+  python workspace.py ws-delete <name>           Delete workspace
+
+  # Utility
+  python workspace.py collections                List Zotero collections
+  python workspace.py status                     Show status
+  python workspace.py delete                     Delete all data
 """
 import sys, os, json, argparse, re, time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict
 import urllib.parse
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
 DATA_DIR = Path.home() / ".local/share/zotero-lance"
+CONFIG_FILE = DATA_DIR / "config.json"
+WORKSPACES_FILE = DATA_DIR / "workspaces.json"
 TABLE_NAME = "papers"
+
+# Model configuration
+EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 
 def out(msg): print(f"[zotero] {msg}", flush=True)
 
-def get_device():
+# --- Config Management ---
+
+def load_config():
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return {}
+
+def save_config(config):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+def load_workspaces():
+    if WORKSPACES_FILE.exists():
+        return json.loads(WORKSPACES_FILE.read_text())
+    return {}
+
+def save_workspaces(ws):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    WORKSPACES_FILE.write_text(json.dumps(ws, indent=2))
+
+# --- Local Embedding Model ---
+
+_embed_model = None
+_embed_tokenizer = None
+
+def get_embed_model():
+    global _embed_model, _embed_tokenizer
+    if _embed_model is None:
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+        out(f"Loading embedding model: {EMBED_MODEL}")
+        _embed_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL, trust_remote_code=True)
+        _embed_model = AutoModel.from_pretrained(EMBED_MODEL, trust_remote_code=True, torch_dtype=torch.float16)
+        device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+        _embed_model = _embed_model.to(device)
+        _embed_model.set_mode("document")
+        out(f"Embedding model loaded on {device}")
+    return _embed_model, _embed_tokenizer
+
+def get_embeddings(texts: List[str]) -> List[List[float]]:
     import torch
-    if torch.backends.mps.is_available(): return "mps"
-    if torch.cuda.is_available(): return "cuda"
-    return "cpu"
+    model, tokenizer = get_embed_model()
+    device = next(model.parameters()).device
+
+    embeddings = []
+    batch_size = 8
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        inputs = tokenizer(batch, padding=True, truncation=True, max_length=8192, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            attention_mask = inputs["attention_mask"]
+            hidden = outputs.last_hidden_state
+            mask_expanded = attention_mask.unsqueeze(-1).expand(hidden.size()).float()
+            sum_hidden = torch.sum(hidden * mask_expanded, dim=1)
+            sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
+            batch_emb = (sum_hidden / sum_mask).cpu().float().tolist()
+            embeddings.extend(batch_emb)
+
+    return embeddings
+
+# --- Local Reranking Model ---
+
+_reranker = None
+_reranker_tokenizer = None
+
+def get_reranker():
+    global _reranker, _reranker_tokenizer
+    if _reranker is None:
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        out(f"Loading reranker: {RERANK_MODEL}")
+        _reranker_tokenizer = AutoTokenizer.from_pretrained(RERANK_MODEL, trust_remote_code=True)
+        _reranker = AutoModelForSequenceClassification.from_pretrained(
+            RERANK_MODEL, trust_remote_code=True, torch_dtype=torch.float16
+        )
+        device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+        _reranker = _reranker.to(device)
+        out(f"Reranker loaded on {device}")
+    return _reranker, _reranker_tokenizer
+
+def rerank(query: str, docs: List[Dict], top_k: int = 10) -> List[Dict]:
+    import torch
+    if not docs:
+        return docs[:top_k]
+
+    model, tokenizer = get_reranker()
+    device = next(model.parameters()).device
+
+    pairs = []
+    for d in docs:
+        text = d.get("text", d.get("title", ""))[:2000]
+        pairs.append([query, text])
+
+    with torch.no_grad():
+        inputs = tokenizer(pairs, padding=True, truncation=True, max_length=512, return_tensors="pt").to(device)
+        scores = model(**inputs, return_dict=True).logits.view(-1).float().cpu().tolist()
+
+    for doc, score in zip(docs, scores):
+        doc["rerank_score"] = float(score)
+
+    reranked = sorted(docs, key=lambda x: x["rerank_score"], reverse=True)
+    return reranked[:top_k]
 
 # --- Zotero API ---
 
@@ -34,11 +149,25 @@ def zotero_api(path, params=None):
     r.raise_for_status()
     return r.json(), int(r.headers.get("Last-Modified-Version", 0))
 
-def get_pdf_items(limit=500):
-    items, ver = zotero_api("items", {"limit": limit, "itemType": "-attachment"})
+def get_collections():
+    items, _ = zotero_api("collections")
+    return {c["data"]["name"]: c["data"]["key"] for c in items}
+
+def get_collection_items(collection_key):
+    items, _ = zotero_api(f"collections/{collection_key}/items", {"itemType": "-attachment"})
+    return [it["data"]["key"] for it in items]
+
+def get_pdf_items(limit=None, keys=None):
+    params = {"itemType": "-attachment"}
+    if limit:
+        params["limit"] = limit
+    items, ver = zotero_api("items", params)
+
     result = []
     for it in items:
         key = it["data"]["key"]
+        if keys and key not in keys:
+            continue
         title = it["data"].get("title", "")
         authors = ", ".join([c.get("lastName", "") for c in it["data"].get("creators", [])[:3]])
         year = (it["data"].get("date") or "")[:4]
@@ -72,96 +201,6 @@ def extract_text(pdf_path, max_pages=10):
     except:
         return ""
 
-# --- Qwen3 Models ---
-
-_embed_model = None
-_rerank_model = None
-
-def load_embed_model():
-    global _embed_model
-    if _embed_model is not None: return _embed_model
-    import torch
-    from transformers import AutoModel, AutoTokenizer
-
-    model_name = "Qwen/Qwen3-Embedding-4B"
-    out(f"Loading {model_name} on {get_device()}...")
-    start = time.time()
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        model_name,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa",
-    ).to(get_device())
-    model.requires_grad_(False)
-
-    out(f"Embedding model loaded in {time.time()-start:.1f}s")
-    _embed_model = (model, tokenizer)
-    return _embed_model
-
-def load_rerank_model():
-    global _rerank_model
-    if _rerank_model is not None: return _rerank_model
-    import torch
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-    model_name = "Qwen/Qwen3-Reranker-4B"
-    out(f"Loading {model_name} on {get_device()}...")
-    start = time.time()
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa",
-    ).to(get_device())
-    model.requires_grad_(False)
-
-    out(f"Reranker model loaded in {time.time()-start:.1f}s")
-    _rerank_model = (model, tokenizer)
-    return _rerank_model
-
-def embed_texts(texts, batch_size=4):
-    import torch
-    model, tokenizer = load_embed_model()
-    device = get_device()
-
-    all_embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        inputs = tokenizer(batch, padding=True, truncation=True, max_length=8192, return_tensors="pt").to(device)
-        with torch.inference_mode():
-            outputs = model(**inputs)
-            attention_mask = inputs['attention_mask']
-            embeddings = outputs.last_hidden_state
-            mask_expanded = attention_mask.unsqueeze(-1).expand(embeddings.size()).float()
-            sum_embeddings = torch.sum(embeddings * mask_expanded, 1)
-            sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
-            mean_embeddings = sum_embeddings / sum_mask
-            mean_embeddings = torch.nn.functional.normalize(mean_embeddings, p=2, dim=1)
-            all_embeddings.extend(mean_embeddings.cpu().numpy().tolist())
-
-    return all_embeddings
-
-def rerank(query, docs, top_k=10):
-    import torch
-    model, tokenizer = load_rerank_model()
-    device = get_device()
-
-    pairs = [[query, doc["text"]] for doc in docs]
-    inputs = tokenizer(pairs, padding=True, truncation=True, max_length=4096, return_tensors="pt").to(device)
-
-    with torch.inference_mode():
-        outputs = model(**inputs)
-        scores = outputs.logits.squeeze(-1).cpu().numpy().tolist()
-
-    for doc, score in zip(docs, scores):
-        doc["rerank_score"] = score
-
-    return sorted(docs, key=lambda x: x["rerank_score"], reverse=True)[:top_k]
-
 # --- LanceDB ---
 
 def get_db():
@@ -169,24 +208,38 @@ def get_db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     return lancedb.connect(str(DATA_DIR))
 
-def cmd_build(limit=None):
-    import pyarrow as pa
+# --- Commands ---
+
+def cmd_collections():
+    collections = get_collections()
+    print(f"\n📚 Zotero Collections ({len(collections)}):\n")
+    for name, key in sorted(collections.items()):
+        print(f"  • {name} [{key}]")
+
+def cmd_build(limit=None, collection=None):
     from tqdm import tqdm
 
+    keys = None
+    if collection:
+        collections = get_collections()
+        if collection not in collections:
+            out(f"Collection '{collection}' not found.")
+            return
+        keys = set(get_collection_items(collections[collection]))
+        out(f"Building index for collection: {collection} ({len(keys)} items)")
+
     out("Fetching papers from Zotero...")
-    items, ver = get_pdf_items(limit=limit or 500)
+    items, ver = get_pdf_items(limit=limit, keys=keys)
     out(f"Found {len(items)} papers with PDFs")
     if not items: return
 
     db = get_db()
-
     try:
         db.drop_table(TABLE_NAME)
     except:
         pass
 
     records = []
-
     for item in tqdm(items, desc="Extracting text"):
         content = extract_text(item["pdf"], max_pages=10)
         text = f"{item['title']} {item['authors']} {item['abstract']} {content}"
@@ -199,23 +252,30 @@ def cmd_build(limit=None):
                 "text": text[:30000],
             })
 
-    out(f"Extracted {len(records)} papers, now embedding...")
-
-    texts = [r["text"] for r in records]
+    out(f"Embedding {len(records)} papers...")
+    texts = [r["text"][:8000] for r in records]
     embeddings = []
-    batch_size = 4
 
-    for i in tqdm(range(0, len(texts), batch_size), desc="Embedding"):
-        batch = texts[i:i+batch_size]
-        batch_emb = embed_texts(batch, batch_size=batch_size)
-        embeddings.extend(batch_emb)
+    for i in tqdm(range(0, len(texts), 8), desc="Embedding"):
+        batch = texts[i:i+8]
+        try:
+            embeddings.extend(get_embeddings(batch))
+        except Exception as e:
+            out(f"Error: {e}")
+            for t in batch:
+                try:
+                    embeddings.extend(get_embeddings([t]))
+                except:
+                    embeddings.append([0.0] * 1024)  # Qwen3-Embedding-0.6B dim
 
     for r, emb in zip(records, embeddings):
         r["vector"] = emb
 
-    table = db.create_table(TABLE_NAME, records)
+    db.create_table(TABLE_NAME, records)
 
-    meta = {"version": ver, "count": len(records)}
+    meta = {"version": ver, "count": len(records), "embed_model": EMBED_MODEL, "rerank_model": RERANK_MODEL}
+    if collection:
+        meta["collection"] = collection
     (DATA_DIR / "meta.json").write_text(json.dumps(meta))
 
     out(f"Done! Indexed {len(records)} papers")
@@ -253,8 +313,8 @@ def cmd_sync():
             })
 
     if records:
-        texts = [r["text"] for r in records]
-        embeddings = embed_texts(texts)
+        texts = [r["text"][:8000] for r in records]
+        embeddings = get_embeddings(texts)
         for r, emb in zip(records, embeddings):
             r["vector"] = emb
         table.add(records)
@@ -266,7 +326,7 @@ def cmd_sync():
 
     out(f"Added {len(records)} papers")
 
-def cmd_search(query: str, top_k: int = 10, year_min: Optional[int] = None):
+def cmd_search(query: str, top_k: int = 10, year_min: Optional[int] = None, keys: set = None, add_to: str = None):
     if not (DATA_DIR / "meta.json").exists():
         out("No index found. Run 'build' first.")
         return
@@ -277,96 +337,257 @@ def cmd_search(query: str, top_k: int = 10, year_min: Optional[int] = None):
     out(f"Searching: {query}")
     start = time.time()
 
-    query_emb = embed_texts([query])[0]
-
-    results = table.search(query_emb).limit(100)
+    query_emb = get_embeddings([query])[0]
+    results = table.search(query_emb).limit(top_k * 3 if keys else top_k * 2)
 
     if year_min:
         results = results.where(f"year >= {year_min}")
 
     candidates = results.to_pandas().to_dict("records")
 
-    if not candidates:
-        print(json.dumps({"query": query, "results": []}, ensure_ascii=False, indent=2))
-        return
-
-    out(f"Reranking {len(candidates)} candidates...")
-    reranked = rerank(query, candidates, top_k=top_k)
+    if keys:
+        candidates = [c for c in candidates if c["key"] in keys]
 
     elapsed = time.time() - start
 
     output = []
-    for r in reranked:
+    result_keys = []
+    for r in candidates[:top_k]:
+        result_keys.append(r["key"])
         output.append({
             "key": r["key"],
             "title": r["title"],
             "authors": r["authors"],
             "year": r["year"],
-            "score": round(r["rerank_score"], 3),
+            "score": round(float(r.get("_distance", 0)), 4),
         })
 
     print(json.dumps({"query": query, "results": output, "time_ms": int(elapsed*1000)}, ensure_ascii=False, indent=2))
 
-def cmd_status():
-    if not (DATA_DIR / "meta.json").exists():
-        out("No index found.")
+    if add_to and result_keys:
+        ws = load_workspaces()
+        if add_to not in ws:
+            ws[add_to] = {"keys": [], "created": time.strftime("%Y-%m-%d %H:%M")}
+            out(f"Created workspace: {add_to}")
+
+        existing = set(ws[add_to]["keys"])
+        added = [k for k in result_keys if k not in existing]
+        ws[add_to]["keys"].extend(added)
+        save_workspaces(ws)
+        out(f"Added {len(added)} papers to workspace '{add_to}'")
+
+# --- Workspace Commands ---
+
+def cmd_ws_list():
+    ws = load_workspaces()
+    if not ws:
+        print("\nNo workspaces. Create one with: workspace.py ws-create <name>")
         return
 
-    meta = json.loads((DATA_DIR / "meta.json").read_text())
+    print(f"\n📂 Workspaces ({len(ws)}):\n")
+    for name, data in ws.items():
+        count = len(data.get("keys", []))
+        print(f"  • {name} ({count} papers)")
+
+def cmd_ws_create(name):
+    ws = load_workspaces()
+    if name in ws:
+        out(f"Workspace '{name}' already exists.")
+        return
+
+    ws[name] = {"keys": [], "created": time.strftime("%Y-%m-%d %H:%M")}
+    save_workspaces(ws)
+    out(f"Created workspace: {name}")
+
+def cmd_ws_add(name, keys_str):
+    ws = load_workspaces()
+    if name not in ws:
+        out(f"Workspace '{name}' not found. Create it first.")
+        return
+
+    keys = [k.strip() for k in keys_str.split(",")]
+    existing = set(ws[name]["keys"])
+    added = [k for k in keys if k not in existing]
+    ws[name]["keys"].extend(added)
+    save_workspaces(ws)
+    out(f"Added {len(added)} papers to '{name}' (total: {len(ws[name]['keys'])})")
+
+def cmd_ws_import(name, collection_name):
+    ws = load_workspaces()
+    if name not in ws:
+        ws[name] = {"keys": [], "created": time.strftime("%Y-%m-%d %H:%M")}
+
+    collections = get_collections()
+    if collection_name not in collections:
+        out(f"Collection '{collection_name}' not found.")
+        cmd_collections()
+        return
+
+    keys = get_collection_items(collections[collection_name])
+    existing = set(ws[name]["keys"])
+    added = [k for k in keys if k not in existing]
+    ws[name]["keys"].extend(added)
+    save_workspaces(ws)
+    out(f"Imported {len(added)} papers from '{collection_name}' to workspace '{name}'")
+
+def cmd_ws_search(name, query, top_k=10):
+    ws = load_workspaces()
+    if name not in ws:
+        out(f"Workspace '{name}' not found.")
+        return
+
+    keys = set(ws[name]["keys"])
+    if not keys:
+        out(f"Workspace '{name}' is empty.")
+        return
+
+    if not (DATA_DIR / "meta.json").exists():
+        out("No index found. Run 'build' first.")
+        return
+
     db = get_db()
     table = db.open_table(TABLE_NAME)
 
-    size_mb = sum(f.stat().st_size for f in DATA_DIR.rglob("*") if f.is_file()) / 1024 / 1024
+    out(f"Searching workspace '{name}' ({len(keys)} papers)")
+    start = time.time()
 
-    print(f"""
-=== Zotero-LanceDB Index Status ===
-Papers indexed: {meta.get('count', 0)}
-Library version: {meta.get('version', 'unknown')}
-Database size: {size_mb:.1f} MB
-Embedding model: Qwen3-Embedding-4B
-Reranker model: Qwen3-Reranker-4B
-Data path: {DATA_DIR}
-""")
+    query_emb = get_embeddings([query])[0]
+    candidates = table.search(query_emb).limit(len(keys) * 2).to_pandas().to_dict("records")
+    candidates = [c for c in candidates if c["key"] in keys]
+
+    if len(candidates) > 0:
+        out(f"Reranking with {RERANK_MODEL}...")
+        candidates = rerank(query, candidates, top_k=top_k)
+
+    elapsed = time.time() - start
+
+    output = []
+    for r in candidates:
+        output.append({
+            "key": r["key"],
+            "title": r["title"],
+            "authors": r["authors"],
+            "year": r["year"],
+            "rerank_score": round(float(r.get("rerank_score", 0)), 4),
+        })
+
+    print(json.dumps({
+        "query": query,
+        "workspace": name,
+        "reranked": True,
+        "results": output,
+        "time_ms": int(elapsed*1000)
+    }, ensure_ascii=False, indent=2))
+
+def cmd_ws_delete(name):
+    ws = load_workspaces()
+    if name not in ws:
+        out(f"Workspace '{name}' not found.")
+        return
+
+    del ws[name]
+    save_workspaces(ws)
+    out(f"Deleted workspace: {name}")
+
+def cmd_status():
+    print("\n=== Zotero Research Assistant ===\n")
+    print(f"Embedding: {EMBED_MODEL}")
+    print(f"Reranker:  {RERANK_MODEL}")
+
+    if (DATA_DIR / "meta.json").exists():
+        meta = json.loads((DATA_DIR / "meta.json").read_text())
+        size_mb = sum(f.stat().st_size for f in DATA_DIR.rglob("*") if f.is_file()) / 1024 / 1024
+        print(f"\nIndex: {meta.get('count', 0)} papers ({size_mb:.1f} MB)")
+        if "collection" in meta:
+            print(f"Collection: {meta['collection']}")
+    else:
+        print("\nNo index. Run 'build' first.")
+
+    ws = load_workspaces()
+    if ws:
+        print(f"\nWorkspaces: {len(ws)}")
+        for name, data in ws.items():
+            print(f"  • {name} ({len(data.get('keys', []))} papers)")
 
 def cmd_delete():
     import shutil
     if DATA_DIR.exists():
         shutil.rmtree(DATA_DIR)
-        out("Deleted database")
+        out("Deleted all data")
     else:
-        out("No index found")
+        out("No data found")
 
 def main():
-    parser = argparse.ArgumentParser(description="Zotero + LanceDB + Qwen3")
+    parser = argparse.ArgumentParser(description="Zotero + LanceDB + Qwen3 Models")
     sub = parser.add_subparsers(dest="cmd")
 
+    sub.add_parser("collections", help="List Zotero collections")
+
     p_build = sub.add_parser("build", help="Build index")
-    p_build.add_argument("--limit", type=int, help="Max papers to index")
+    p_build.add_argument("--limit", type=int, help="Max papers")
+    p_build.add_argument("--collection", type=str, help="Only index this collection")
 
     sub.add_parser("sync", help="Sync new papers")
 
-    p_search = sub.add_parser("search", help="Search papers")
+    p_search = sub.add_parser("search", help="Search all papers")
     p_search.add_argument("query", help="Search query")
-    p_search.add_argument("-k", type=int, default=10, help="Top K results")
-    p_search.add_argument("--year", type=int, help="Min year filter")
+    p_search.add_argument("-k", type=int, default=10, help="Top K")
+    p_search.add_argument("--year", type=int, help="Min year")
+    p_search.add_argument("--add-to", type=str, help="Add results to workspace")
 
-    sub.add_parser("status", help="Show index status")
-    sub.add_parser("delete", help="Delete index")
+    sub.add_parser("ws-list", help="List workspaces")
+
+    p_ws_create = sub.add_parser("ws-create", help="Create workspace")
+    p_ws_create.add_argument("name", help="Workspace name")
+
+    p_ws_add = sub.add_parser("ws-add", help="Add papers to workspace")
+    p_ws_add.add_argument("name", help="Workspace name")
+    p_ws_add.add_argument("keys", help="Comma-separated paper keys")
+
+    p_ws_import = sub.add_parser("ws-import", help="Import collection to workspace")
+    p_ws_import.add_argument("name", help="Workspace name")
+    p_ws_import.add_argument("collection", help="Collection name")
+
+    p_ws_search = sub.add_parser("ws-search", help="Search within workspace")
+    p_ws_search.add_argument("name", help="Workspace name")
+    p_ws_search.add_argument("query", help="Search query")
+    p_ws_search.add_argument("-k", type=int, default=10, help="Top K")
+
+    p_ws_delete = sub.add_parser("ws-delete", help="Delete workspace")
+    p_ws_delete.add_argument("name", help="Workspace name")
+
+    sub.add_parser("status", help="Show status")
+    sub.add_parser("delete", help="Delete all data")
 
     args = parser.parse_args()
 
-    if args.cmd == "build":
-        cmd_build(args.limit)
+    if args.cmd == "collections":
+        cmd_collections()
+    elif args.cmd == "build":
+        cmd_build(args.limit, args.collection)
     elif args.cmd == "sync":
         cmd_sync()
     elif args.cmd == "search":
-        cmd_search(args.query, args.k, args.year)
+        cmd_search(args.query, args.k, args.year, add_to=args.add_to)
+    elif args.cmd == "ws-list":
+        cmd_ws_list()
+    elif args.cmd == "ws-create":
+        cmd_ws_create(args.name)
+    elif args.cmd == "ws-add":
+        cmd_ws_add(args.name, args.keys)
+    elif args.cmd == "ws-import":
+        cmd_ws_import(args.name, args.collection)
+    elif args.cmd == "ws-search":
+        cmd_ws_search(args.name, args.query, args.k)
+    elif args.cmd == "ws-delete":
+        cmd_ws_delete(args.name)
     elif args.cmd == "status":
         cmd_status()
     elif args.cmd == "delete":
         cmd_delete()
     else:
         parser.print_help()
+        print("\nStart with: workspace.py build")
 
 if __name__ == "__main__":
     main()
