@@ -59,32 +59,44 @@ def save_workspaces(ws):
 
 _embed_model = None
 _embed_tokenizer = None
+_embed_device = None
+_embed_dim = None
+
+def get_device():
+    import torch
+    if torch.backends.mps.is_available():
+        return "mps"
+    elif torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 def get_embed_model():
-    global _embed_model, _embed_tokenizer
+    global _embed_model, _embed_tokenizer, _embed_device, _embed_dim
     if _embed_model is None:
         import torch
         from transformers import AutoModel, AutoTokenizer
         out(f"Loading embedding model: {EMBED_MODEL}")
         _embed_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL, trust_remote_code=True)
-        _embed_model = AutoModel.from_pretrained(EMBED_MODEL, trust_remote_code=True, torch_dtype=torch.float16)
-        device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
-        _embed_model = _embed_model.to(device)
-        _embed_model.set_mode("document")
-        out(f"Embedding model loaded on {device}")
+        _embed_model = AutoModel.from_pretrained(EMBED_MODEL, trust_remote_code=True)
+        _embed_device = get_device()
+        _embed_model = _embed_model.to(_embed_device).half()
+        _embed_dim = _embed_model.config.hidden_size
+        out(f"Embedding model loaded on {_embed_device} (dim={_embed_dim})")
     return _embed_model, _embed_tokenizer
 
-def get_embeddings(texts: List[str]) -> List[List[float]]:
+def get_embeddings(texts: List[str], mode: str = "document") -> List[List[float]]:
     import torch
     model, tokenizer = get_embed_model()
-    device = next(model.parameters()).device
+
+    if hasattr(model, "set_mode"):
+        model.set_mode(mode)
 
     embeddings = []
     batch_size = 8
 
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i+batch_size]
-        inputs = tokenizer(batch, padding=True, truncation=True, max_length=8192, return_tensors="pt").to(device)
+        inputs = tokenizer(batch, padding=True, truncation=True, max_length=8192, return_tensors="pt").to(_embed_device)
 
         with torch.no_grad():
             outputs = model(**inputs)
@@ -103,19 +115,18 @@ def get_embeddings(texts: List[str]) -> List[List[float]]:
 _reranker = None
 _reranker_tokenizer = None
 
+_reranker_device = None
+
 def get_reranker():
-    global _reranker, _reranker_tokenizer
+    global _reranker, _reranker_tokenizer, _reranker_device
     if _reranker is None:
-        import torch
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
         out(f"Loading reranker: {RERANK_MODEL}")
         _reranker_tokenizer = AutoTokenizer.from_pretrained(RERANK_MODEL, trust_remote_code=True)
-        _reranker = AutoModelForSequenceClassification.from_pretrained(
-            RERANK_MODEL, trust_remote_code=True, torch_dtype=torch.float16
-        )
-        device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
-        _reranker = _reranker.to(device)
-        out(f"Reranker loaded on {device}")
+        _reranker = AutoModelForSequenceClassification.from_pretrained(RERANK_MODEL, trust_remote_code=True)
+        _reranker_device = get_device()
+        _reranker = _reranker.to(_reranker_device).half()
+        out(f"Reranker loaded on {_reranker_device}")
     return _reranker, _reranker_tokenizer
 
 def rerank(query: str, docs: List[Dict], top_k: int = 10) -> List[Dict]:
@@ -124,7 +135,6 @@ def rerank(query: str, docs: List[Dict], top_k: int = 10) -> List[Dict]:
         return docs[:top_k]
 
     model, tokenizer = get_reranker()
-    device = next(model.parameters()).device
 
     pairs = []
     for d in docs:
@@ -132,7 +142,7 @@ def rerank(query: str, docs: List[Dict], top_k: int = 10) -> List[Dict]:
         pairs.append([query, text])
 
     with torch.no_grad():
-        inputs = tokenizer(pairs, padding=True, truncation=True, max_length=512, return_tensors="pt").to(device)
+        inputs = tokenizer(pairs, padding=True, truncation=True, max_length=512, return_tensors="pt").to(_reranker_device)
         scores = model(**inputs, return_dict=True).logits.view(-1).float().cpu().tolist()
 
     for doc, score in zip(docs, scores):
@@ -259,14 +269,14 @@ def cmd_build(limit=None, collection=None):
     for i in tqdm(range(0, len(texts), 8), desc="Embedding"):
         batch = texts[i:i+8]
         try:
-            embeddings.extend(get_embeddings(batch))
+            embeddings.extend(get_embeddings(batch, mode="document"))
         except Exception as e:
             out(f"Error: {e}")
             for t in batch:
                 try:
-                    embeddings.extend(get_embeddings([t]))
+                    embeddings.extend(get_embeddings([t], mode="document"))
                 except:
-                    embeddings.append([0.0] * 1024)  # Qwen3-Embedding-0.6B dim
+                    embeddings.append([0.0] * _embed_dim if _embed_dim else [0.0] * 1024)
 
     for r, emb in zip(records, embeddings):
         r["vector"] = emb
@@ -314,7 +324,7 @@ def cmd_sync():
 
     if records:
         texts = [r["text"][:8000] for r in records]
-        embeddings = get_embeddings(texts)
+        embeddings = get_embeddings(texts, mode="document")
         for r, emb in zip(records, embeddings):
             r["vector"] = emb
         table.add(records)
@@ -337,7 +347,7 @@ def cmd_search(query: str, top_k: int = 10, year_min: Optional[int] = None, keys
     out(f"Searching: {query}")
     start = time.time()
 
-    query_emb = get_embeddings([query])[0]
+    query_emb = get_embeddings([query], mode="query")[0]
     results = table.search(query_emb).limit(top_k * 3 if keys else top_k * 2)
 
     if year_min:
@@ -451,7 +461,7 @@ def cmd_ws_search(name, query, top_k=10):
     out(f"Searching workspace '{name}' ({len(keys)} papers)")
     start = time.time()
 
-    query_emb = get_embeddings([query])[0]
+    query_emb = get_embeddings([query], mode="query")[0]
     candidates = table.search(query_emb).limit(len(keys) * 2).to_pandas().to_dict("records")
     candidates = [c for c in candidates if c["key"] in keys]
 
