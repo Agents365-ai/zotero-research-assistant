@@ -1,118 +1,144 @@
 # Zotero Research Assistant
 
-Multimodal semantic search over your Zotero library using **Qdrant + Jina-embeddings-v4**.
+![Claude Code](https://img.shields.io/badge/Claude_Code-compatible-blue)
+![OpenCode](https://img.shields.io/badge/OpenCode-compatible-green)
+
+Semantic search over your Zotero library using **LanceDB** vector database with **Qwen3** embedding and reranking models.
+
+## Features
+
+- **Semantic Search** - Find papers by meaning, not just keywords
+- **Neural Reranking** - Qwen3-Reranker-4B improves result relevance
+- **Full-Text Indexing** - Extracts and indexes PDF content (first 10 pages)
+- **Year Filtering** - Filter results by publication year
+- **Incremental Sync** - Add new papers without rebuilding entire index
 
 ## Architecture
 
 ```
-Zotero 8 (localhost:23119)
-       │
-       ▼
-   PDF Files
-       │
-       ▼ PyMuPDF (150 DPI, max 15 pages/paper)
-       │
-  Page Images
-       │
-       ▼ Jina-embeddings-v4 (multimodal)
-       │
-  ┌────┴────┐
-  │         │
-Dense    Multi-vector
-2048d    128d × N tokens
-  │         │
-  └────┬────┘
-       ▼
-    Qdrant (local)
-       │
-       ▼ Two-stage retrieval
-       │
-   Results
+Zotero 7/8 (localhost:23119)
+  ├─ Metadata API → Paper metadata
+  └─ PDF Files → PyMuPDF text extraction
+                      ↓
+              Qwen3-Embedding-4B (4B params)
+                      ↓
+              LanceDB vector storage
+                      ↓
+              Vector similarity search
+                      ↓
+              Qwen3-Reranker-4B (reranking)
+                      ↓
+              Top-K results with scores
 ```
 
-## Retrieval Pipeline
+## Installation
 
-### Stage 1: Dense Prefetch
-- Query encoded to single 2048d vector
-- Fast cosine similarity search
-- Returns top 100 candidates
+### Requirements
 
-### Stage 2: MaxSim Rerank
-- Query encoded to multi-vector (128d × N tokens)
-- Each query token computes max similarity across all document patches
-- Sum of max similarities = final score
-- Returns top K results
+- Python 3.10+
+- [Zotero 7/8](https://www.zotero.org/) running locally (localhost:23119)
+- ~16GB RAM (for Qwen3 4B models)
+- Apple Silicon / NVIDIA GPU recommended
 
-This **late interaction** approach captures fine-grained token-level matching while maintaining efficiency through the two-stage design.
+### Setup
 
-## Key Components
-
-| Component | Purpose |
-|-----------|---------|
-| `workspace.py` | Main CLI - build, sync, search, status, delete |
-| `zotero-query.py` | Metadata queries via Zotero API |
-| Jina-v4 | Multimodal encoder (text + image, 4B params) |
-| Qdrant | Vector DB with MaxSim support |
-| PyMuPDF | PDF to image conversion |
-
-## Data Flow
-
-### Indexing (`build`)
-1. Fetch papers with PDFs from Zotero API
-2. Convert each PDF to page images (150 DPI)
-3. Encode images with Jina-v4:
-   - `dense`: Single 2048d vector per page
-   - `multivector`: 128d × N tokens per page
-4. Store in Qdrant with payload (title, authors, year, page_num)
-
-### Search (`search`)
-1. Encode query text with Jina-v4 (both dense + multi-vector)
-2. Prefetch: Dense similarity → top 100 pages
-3. Rerank: MaxSim on multi-vectors → top K×3 pages
-4. Deduplicate by paper (keep best page per paper)
-5. Return top K papers with scores
-
-## Why This Approach?
-
-**vs. Text-only RAG:**
-- Captures figures, tables, equations that text extraction misses
-- No OCR errors from complex layouts
-
-**vs. Separate text/image indexes:**
-- Single unified embedding space
-- Simpler architecture, easier to maintain
-
-**vs. ColPali/ColQwen:**
-- Jina-v4 supports both single-vector (fast) and multi-vector (precise)
-- Better macOS MPS compatibility
-- Proven production quality
-
-## Storage
-
+1. Clone the repository:
+```bash
+git clone https://github.com/Agents365-ai/zotero-research-assistant.git
 ```
-~/.local/share/zotero-qdrant/
-├── qdrant_db/          # Vector database
-│   ├── collection/     # Indexed vectors
-│   └── meta.json       # DB metadata
-└── meta.json           # Index metadata (keys, version)
+
+2. Install as Claude Code skill:
+```bash
+cp -r zotero-research-assistant ~/.claude/skills/
+```
+
+Or for OpenCode:
+```bash
+cp -r zotero-research-assistant ~/.opencode/skills/
+```
+
+3. Create conda environment:
+```bash
+conda create -n zotero-ra python=3.10
+conda activate zotero-ra
+pip install torch transformers lancedb pymupdf requests tqdm pyarrow
+```
+
+## Usage
+
+```bash
+python workspace.py <command> [options]
+```
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `build` | Build index from all Zotero PDFs |
+| `build --limit N` | Build index from first N papers |
+| `sync` | Add new papers to existing index |
+| `search "query"` | Semantic search with reranking |
+| `search "query" -k 20` | Return top 20 results |
+| `search "query" --year 2020` | Filter by minimum year |
+| `status` | Show index statistics |
+| `delete` | Delete the index |
+
+### Examples
+
+```bash
+# Build index (first 100 papers for testing)
+python workspace.py build --limit 100
+
+# Search
+python workspace.py search "single cell RNA sequencing"
+
+# Search with filters
+python workspace.py search "CRISPR gene editing" -k 5 --year 2022
+
+# Check index status
+python workspace.py status
+```
+
+## Metadata Queries
+
+Use `zotero-query.py` for metadata operations (no vector search):
+
+```bash
+python zotero-query.py search "keyword"    # Search by metadata
+python zotero-query.py detail <key>        # Get paper details
+python zotero-query.py collections         # List collections
 ```
 
 ## Performance
 
-On M4 Max with MPS acceleration:
-- Model load: ~25s
-- Page encoding: ~20s/page (varies with content)
-- Search latency: <500ms (100 prefetch + MaxSim rerank)
-- Storage: ~4MB per 10 papers (varies with page count)
+| Metric | Value |
+|--------|-------|
+| Embedding model | Qwen3-Embedding-4B |
+| Reranker model | Qwen3-Reranker-4B |
+| Build speed | ~1-2 papers/minute |
+| Search latency | 2-5 seconds (includes reranking) |
+| Storage | ~4MB per paper |
+
+## Storage
+
+```
+~/.local/share/zotero-lance/
+├── papers.lance/    # LanceDB vector database
+└── meta.json        # Index metadata
+```
 
 ## Dependencies
 
 ```
 torch
 transformers
-qdrant-client
+lancedb
 pymupdf
-pillow
 requests
 tqdm
+pyarrow
 ```
+
+## License
+
+MIT
