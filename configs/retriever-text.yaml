@@ -1,0 +1,32 @@
+model_name_or_path: openbmb/MiniCPM-Embedding-Light
+corpus_path: ~/.local/share/zotero-research-assistant/corpora/chunks.jsonl
+embedding_path: ~/.local/share/zotero-research-assistant/index/text/embedding.npy
+collection_name: zotero_text
+
+backend: sentence_transformers
+backend_configs:
+  sentence_transformers:
+    trust_remote_code: true
+    sentence_transformers_encode:
+      normalize_embeddings: false
+      encode_chunk_size: 256
+      q_prompt_name: query
+      psg_prompt_name: document
+      psg_task: null
+      q_task: null
+
+index_backend: faiss
+index_backend_configs:
+  faiss:
+    index_use_gpu: false
+    index_chunk_size: 10000
+    index_path: ~/.local/share/zotero-research-assistant/index/text/index.index
+
+batch_size: 16
+top_k: 10
+gpu_ids: null
+query_instruction: ""
+is_multimodal: false
+overwrite: false
+retrieve_thread_num: 1
+is_demo: false

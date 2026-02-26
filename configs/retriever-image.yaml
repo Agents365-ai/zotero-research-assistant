@@ -1,0 +1,32 @@
+model_name_or_path: jinaai/jina-embeddings-v4
+corpus_path: ~/.local/share/zotero-research-assistant/corpora/image.jsonl
+embedding_path: ~/.local/share/zotero-research-assistant/index/image/embedding.npy
+collection_name: zotero_image
+
+backend: sentence_transformers
+backend_configs:
+  sentence_transformers:
+    trust_remote_code: true
+    sentence_transformers_encode:
+      normalize_embeddings: false
+      encode_chunk_size: 64
+      q_prompt_name: null
+      psg_prompt_name: null
+      psg_task: retrieval
+      q_task: retrieval
+
+index_backend: faiss
+index_backend_configs:
+  faiss:
+    index_use_gpu: false
+    index_chunk_size: 10000
+    index_path: ~/.local/share/zotero-research-assistant/index/image/index.index
+
+batch_size: 8
+top_k: 5
+gpu_ids: null
+query_instruction: ""
+is_multimodal: true
+overwrite: false
+retrieve_thread_num: 1
+is_demo: false
