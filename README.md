@@ -3,19 +3,21 @@
 ![Claude Code](https://img.shields.io/badge/Claude_Code-compatible-blue)
 ![OpenCode](https://img.shields.io/badge/OpenCode-compatible-green)
 
-Semantic search over your Zotero library using **LanceDB** vector database with **local Qwen3** embedding and reranking models.
+Semantic search over your Zotero library using **LanceDB** vector database with **local Qwen3** embedding and multiple reranking options optimized for Apple Silicon.
 
 **No external servers required** - runs entirely on your local machine.
 
 ## Features
 
 - **Semantic Search** - Find papers by meaning, not just keywords
-- **Neural Reranking** - Qwen3-Reranker improves result relevance
+- **Metadata Search** - Quick keyword search via Zotero API (no index needed)
+- **Multiple Rerankers** - jina-v3 (MLX), Qwen3, or mmarco
+- **Apple Silicon Optimized** - MLX native acceleration on M-series chips
 - **Full-Text Indexing** - Extracts and indexes PDF content (first 10 pages)
 - **Research Workspaces** - Create focused subsets for specific projects
 - **Year Filtering** - Filter results by publication year
 - **Incremental Sync** - Add new papers without rebuilding entire index
-- **Zero Configuration** - No Ollama/LM Studio setup needed
+- **API Architecture** - Models loaded once, fast repeated queries
 
 ## Architecture
 
@@ -24,15 +26,23 @@ Zotero 7/8 (localhost:23119)
   ├─ Metadata API → Paper metadata
   └─ PDF Files → PyMuPDF text extraction
                       ↓
-              Qwen3-Embedding-0.6B (local)
+         model_server.py (:8765)
+         ┌─────────────────────────────┐
+         │ POST /embed                 │
+         │   Qwen3-Embedding-0.6B (MPS)│
+         │   • last_token_pool         │
+         │   • L2 normalize            │
+         │   • 1024-dim vectors        │
+         ├─────────────────────────────┤
+         │ POST /rerank                │
+         │   • jina-v3-mlx (MLX)       │
+         │   • qwen (CPU)              │
+         │   • mmarco (CPU)            │
+         └─────────────────────────────┘
                       ↓
-              LanceDB vector storage
+         LanceDB (~/.local/share/zotero-lance/)
                       ↓
-              Vector similarity search
-                      ↓
-              Qwen3-Reranker-0.6B (local)
-                      ↓
-              Top-K results with scores
+         Top-K results with scores
 ```
 
 ## Prerequisites
@@ -42,7 +52,7 @@ Zotero 7/8 (localhost:23119)
 | Requirement | Minimum | Recommended |
 |-------------|---------|-------------|
 | RAM | 8GB | 16GB |
-| GPU | - | Apple Silicon / NVIDIA |
+| GPU | - | Apple Silicon |
 | Storage | 5GB | 20GB+ |
 | Python | 3.10+ | 3.11 |
 
@@ -55,140 +65,147 @@ Zotero 7/8 (localhost:23119)
 2. **Conda/Mamba** (recommended for environment management)
    - Miniforge: https://github.com/conda-forge/miniforge
 
-3. **PyTorch** with MPS/CUDA support
-   - Apple Silicon: MPS backend (automatic)
-   - NVIDIA: CUDA toolkit required
+3. **PyTorch** with MPS support (Apple Silicon)
 
-### Hugging Face Models (auto-downloaded)
+### Models (auto-downloaded)
 
-| Model | Size | Purpose |
-|-------|------|---------|
-| `Qwen/Qwen3-Embedding-0.6B` | ~1.2GB | Text to vectors |
-| `Qwen/Qwen3-Reranker-0.6B` | ~1.2GB | Query-document scoring |
+| Model | Size | Purpose | Backend |
+|-------|------|---------|---------|
+| `Qwen/Qwen3-Embedding-0.6B` | ~1.2GB | Text to vectors | MPS |
+| `jinaai/jina-reranker-v3-mlx` | ~1.2GB | Reranking (default) | MLX |
+| `Qwen/Qwen3-Reranker-0.6B` | ~1.2GB | Reranking (optional) | CPU |
+| `cross-encoder/mmarco-mMiniLMv2` | ~500MB | Reranking (optional) | CPU |
 
 Models download automatically on first run to `~/.cache/huggingface/`.
 
 ## Installation
 
-1. Clone the repository:
+### Option A: pip install
+
 ```bash
 git clone https://github.com/Agents365-ai/zotero-research-assistant.git
+cd zotero-research-assistant
+pip install -e ".[mlx]"
 ```
 
-2. Install as Claude Code skill:
+After install, use `zra` and `zra-server` commands directly.
+
+### Option B: Claude Code skill
+
 ```bash
+git clone https://github.com/Agents365-ai/zotero-research-assistant.git
 cp -r zotero-research-assistant ~/.claude/skills/
 ```
 
-Or for OpenCode:
+### Environment setup (if not using pip install)
+
 ```bash
-cp -r zotero-research-assistant ~/.opencode/skills/
+conda create -n zotero-ra python=3.11
+conda activate zotero-ra
+pip install torch transformers lancedb pymupdf requests tqdm pyarrow flask sentence-transformers mlx mlx-lm huggingface_hub
 ```
 
-3. Create conda environment:
+## Quick Start
+
+### 1. Start the Model Server
+
 ```bash
-conda create -n zotero-ra python=3.10
-conda activate zotero-ra
-pip install torch transformers lancedb pymupdf requests tqdm pyarrow
+# Default: jina-v3-mlx (fastest on Apple Silicon)
+zra-server --preload --port 8765
+
+# Or with alternative rerankers:
+zra-server --preload --reranker qwen   # Qwen3-Reranker
+zra-server --preload --reranker mmarco # mmarco-mMiniLMv2
+```
+
+### 2. Build the Index
+
+```bash
+zra build              # Full library
+zra build --limit 100  # First 100 papers (testing)
+```
+
+### 3. Search
+
+```bash
+zra search "single cell RNA sequencing" --rerank
 ```
 
 ## Usage
 
 ```bash
-python workspace.py <command> [options]
+zra <command> [options]
 ```
 
-### Index Commands
+### Search Commands
 
-| Command | Description |
-|---------|-------------|
-| `build` | Build index from all Zotero PDFs |
-| `build --limit N` | Build index from first N papers |
-| `build --collection NAME` | Build index from specific collection |
-| `sync` | Add new papers to existing index |
-| `search "query"` | Semantic search |
-| `search "query" -k 20` | Return top 20 results |
-| `search "query" --year 2020` | Filter by minimum year |
-| `search "query" --add-to WS` | Add results to workspace |
-| `collections` | List Zotero collections |
-| `status` | Show index statistics |
-| `delete` | Delete the index |
+| Command | Needs Model Server | Description |
+|---------|-------------------|-------------|
+| `search "query" [--rerank] [-k N] [--year Y]` | Yes | Semantic search over indexed papers |
+| `search "query" --add-to WS` | Yes | Search and add results to workspace |
+| `meta-search "query" [--limit N]` | No | Zotero metadata search (title/author/tag) |
+
+### Browse Commands
+
+| Command | Needs Model Server | Description |
+|---------|-------------------|-------------|
+| `get KEY` | No | Full paper metadata from Zotero API |
+| `fulltext KEY` | No | Zotero's indexed full-text content |
+| `list [--limit N] [--offset N] [--sort year\|title]` | No | Browse indexed papers |
+| `collections` | No | List Zotero collections |
+| `tags [--limit N]` | No | List all Zotero tags |
+| `status` | No | Index statistics |
+| `delete [--force]` | No | Delete all data |
 
 ### Workspace Commands
 
-Workspaces let you create focused paper subsets for specific research projects.
+| Command | Needs Model Server | Description |
+|---------|-------------------|-------------|
+| `ws-create NAME` | No | Create a new workspace |
+| `ws-list` | No | List all workspaces |
+| `ws-show NAME` | No | Show papers in workspace |
+| `ws-add NAME KEYS` | No | Add papers (comma-separated keys) |
+| `ws-remove NAME KEYS` | No | Remove papers |
+| `ws-import NAME COLLECTION` | No | Import Zotero collection |
+| `ws-search NAME "query" [--rerank] [-k N]` | Yes | Search within workspace |
+| `ws-delete NAME` | No | Delete workspace |
 
-| Command | Description |
-|---------|-------------|
-| `ws-list` | List all workspaces |
-| `ws-create NAME` | Create a new workspace |
-| `ws-add NAME KEYS` | Add papers by key (comma-separated) |
-| `ws-import NAME COLLECTION` | Import Zotero collection to workspace |
-| `ws-search NAME "query"` | Search within workspace (with reranking) |
-| `ws-delete NAME` | Delete a workspace |
-
-### Examples
-
-**Natural language prompts** (when using with AI coding assistant):
-
-```
-"Build the Zotero search index"
-"Search my library for papers about single cell RNA sequencing"
-"Find recent papers on CRISPR gene editing from 2022 onwards"
-"Create a workspace called 'scRNA-seq' for my single cell papers"
-"Import the 'Machine Learning' collection to a workspace"
-"Search my ML workspace for transformer architectures"
-```
-
-**Direct CLI commands**:
+### Interactive Shell
 
 ```bash
-# Build index (first 100 papers for testing)
-python workspace.py build --limit 100
-
-# Build from specific collection
-python workspace.py build --collection "Machine Learning"
-
-# Search
-python workspace.py search "single cell RNA sequencing"
-
-# Search with filters
-python workspace.py search "CRISPR gene editing" -k 5 --year 2022
-
-# Create workspace and add search results
-python workspace.py ws-create myproject
-python workspace.py search "deep learning" --add-to myproject
-
-# Import collection to workspace
-python workspace.py ws-import myproject "Deep Learning Papers"
-
-# Search within workspace (uses reranking)
-python workspace.py ws-search myproject "attention mechanism"
-
-# Check status
-python workspace.py status
+zra shell
 ```
 
-## Metadata Queries
+## Model Server API
 
-Use `zotero-query.py` for metadata operations (no vector search):
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check, shows reranker type |
+| `/embed` | POST | `{"texts": [...], "mode": "query"\|"document"}` |
+| `/rerank` | POST | `{"query": "...", "docs": [...], "top_k": 10}` |
 
 ```bash
-python zotero-query.py search "keyword"    # Search by metadata
-python zotero-query.py detail <key>        # Get paper details
-python zotero-query.py collections         # List collections
+# Health check
+curl http://127.0.0.1:8765/health
+
+# Embed texts
+curl -X POST http://127.0.0.1:8765/embed \
+  -H "Content-Type: application/json" \
+  -d '{"texts": ["hello world"], "mode": "query"}'
+
+# Rerank documents
+curl -X POST http://127.0.0.1:8765/rerank \
+  -H "Content-Type: application/json" \
+  -d '{"query": "machine learning", "docs": ["doc1", "doc2"], "top_k": 2}'
 ```
 
-## Performance
+## Reranker Comparison
 
-| Metric | Value |
-|--------|-------|
-| Embedding model | Qwen3-Embedding-0.6B |
-| Reranker model | Qwen3-Reranker-0.6B |
-| Build speed | ~2-3 papers/minute |
-| Search latency | 1-3 seconds |
-| Workspace search | 2-5 seconds (includes reranking) |
-| Storage | ~4MB per paper |
+| Reranker | Backend | Speed | Memory | Multilingual |
+|----------|---------|-------|--------|--------------|
+| **jina** (default) | MLX | ~0.5s | ~1.5GB | 26+ languages |
+| **qwen** | CPU | ~2s | ~1.5GB | Chinese/English |
+| **mmarco** | CPU | ~1s | ~500MB | 14 languages |
 
 ## Storage
 
@@ -200,17 +217,22 @@ python zotero-query.py collections         # List collections
 └── workspaces.json     # Workspace definitions
 ```
 
-## Dependencies
+## Troubleshooting
 
+### Model server not responding
+```bash
+curl http://127.0.0.1:8765/health
+pkill -f model_server.py
+zra-server --preload --port 8765
 ```
-torch
-transformers
-lancedb
-pymupdf
-requests
-tqdm
-pyarrow
-```
+
+### Zotero not connected
+- Ensure Zotero is running
+- Check API: `curl http://localhost:23119/api/users/0/items?limit=1`
+
+### Out of memory
+- Use `--reranker mmarco` (smaller model)
+- Close other applications
 
 ## License
 
