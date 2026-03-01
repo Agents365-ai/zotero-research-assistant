@@ -231,7 +231,8 @@ def rerank():
 
     return jsonify({"results": results})
 
-if __name__ == "__main__":
+def main():
+    global RERANKER_TYPE, RERANK_MODEL
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--preload", action="store_true", help="Preload models on startup")
@@ -257,3 +258,6 @@ if __name__ == "__main__":
         print("[server] Models ready!")
 
     app.run(host="127.0.0.1", port=args.port, threaded=False)
+
+if __name__ == "__main__":
+    main()

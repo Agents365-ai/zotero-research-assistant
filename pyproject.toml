@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zotero-research-assistant"
+version = "0.2.0"
+description = "Semantic search over Zotero libraries using LanceDB + local Qwen3 models"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "transformers",
+    "lancedb",
+    "pymupdf",
+    "requests",
+    "tqdm",
+    "pyarrow",
+    "flask",
+    "sentence-transformers",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+mlx = ["mlx", "mlx-lm"]
+
+[project.scripts]
+zra = "workspace:main"
+zra-server = "model_server:main"

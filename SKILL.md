@@ -5,68 +5,85 @@ description: Use when user wants to search Zotero library, query literature meta
 
 # Zotero Research Assistant
 
-Semantic search over your Zotero library using LanceDB + local Qwen3 models.
-
 ## Setup
 
-- Python env: `/Users/niehu/mambaforge/envs/zotero-ra/bin/python`
-- Zotero API: `http://localhost:23119` (must be running)
-- Data: `~/.local/share/zotero-lance/`
+- Python: `/Users/niehu/mambaforge/envs/zotero-ra/bin/python`
+- Scripts: `/Users/niehu/.claude/skills/zotero-research-assistant/`
+- Run commands as: `$PYTHON $SCRIPTS/workspace.py <command>`
 
-## Quick Reference
+## Pre-flight (before ANY command that needs embedding/reranking)
 
-| Task | Command |
-|------|---------|
-| Build index | `python workspace.py build` |
-| Build (limit) | `python workspace.py build --limit 100` |
-| Sync new papers | `python workspace.py sync` |
-| Search | `python workspace.py search "query"` |
-| Search (top K) | `python workspace.py search "query" -k 20` |
-| Search (year filter) | `python workspace.py search "query" --year 2020` |
-| Index status | `python workspace.py status` |
-| Delete index | `python workspace.py delete` |
+Check model server and Zotero are running:
 
-## Metadata Query
-
-| Task | Command |
-|------|---------|
-| Search papers | `python zotero-query.py search "keyword"` |
-| Paper details | `python zotero-query.py detail <key>` |
-| List collections | `python zotero-query.py collections` |
-
-All commands use: `/Users/niehu/mambaforge/envs/zotero-ra/bin/python /Users/niehu/.claude/skills/zotero-research-assistant/<script>`
-
-## Architecture
-
-```
-Zotero 7/8 (localhost:23119)
-  ├─ Metadata → zotero-query.py
-  └─ PDFs → PyMuPDF text extraction
-               ↓
-       Qwen3-Embedding-0.6B (local)
-               ↓
-       LanceDB (similarity search)
-               ↓
-       Qwen3-Reranker-0.6B (local)
-               ↓
-       Top-K results with scores
+```bash
+curl -sf http://127.0.0.1:8765/health && echo "Model server OK" || echo "Model server DOWN"
+curl -sf http://localhost:23119/api/users/0/items?limit=1 > /dev/null && echo "Zotero OK" || echo "Zotero DOWN"
 ```
 
-## Models (Local, No External Server)
+- Model server down → tell user: `python model_server.py --preload --port 8765`
+- Zotero down → tell user to open Zotero app
 
-| Model | Purpose | Size |
-|-------|---------|------|
-| Qwen/Qwen3-Embedding-0.6B | Text to vectors | ~1.2GB |
-| Qwen/Qwen3-Reranker-0.6B | Score query-doc pairs | ~1.2GB |
+Note: `meta-search`, `get`, `tags`, `collections` only need Zotero, not model server.
 
-Models auto-download on first run. No Ollama or LM Studio required.
+## Workflows
 
-## Performance
+### "Find papers about X" (semantic search)
+1. Pre-flight check
+2. `workspace.py search "<query>" --rerank -k 10`
+3. Format results as readable table (title, authors, year, score)
+4. Offer: "Want to add these to a workspace?"
+5. If yes → re-run with `--add-to <workspace_name>`
 
-- **Build speed**: ~2-3 papers/minute
-- **Search latency**: 1-3 seconds (includes reranking)
-- **Storage**: ~4MB per paper
+### "Search for papers by keyword/author/tag" (metadata search)
+1. `workspace.py meta-search "<keyword>" --limit 20`
+2. No model server needed — queries Zotero API directly
 
-## Storage
+### "Tell me about paper X" / "Get details for KEY"
+1. `workspace.py get <key>`
+2. Returns full metadata (title, authors, DOI, tags, PDF paths)
 
-Index location: `~/.local/share/zotero-lance/`
+### "What's in my library about X?" (first time)
+1. Check if index exists: `workspace.py status`
+2. If no index → `workspace.py build` (full) or `workspace.py build --limit 100` (quick test)
+3. Then search as above
+
+### "Sync / update my index"
+1. `workspace.py sync`
+2. Reports count of new papers added
+
+### "Create a workspace for project X"
+1. `workspace.py ws-create "<name>"`
+2. Search for relevant papers: `workspace.py search "<topic>" --rerank -k 20`
+3. Add results: `workspace.py ws-add "<name>" "<key1>,<key2>,..."`
+4. Or import a Zotero collection: `workspace.py ws-import "<name>" "<collection>"`
+
+### "Search within my workspace"
+1. `workspace.py ws-search "<name>" "<query>" --rerank`
+
+### "Show me all tags" / "List collections"
+1. `workspace.py tags`
+2. `workspace.py collections`
+
+## Command Reference
+
+| Command | Needs Model Server | Description |
+|---------|-------------------|-------------|
+| `search "q" [--rerank] [-k N] [--year Y]` | Yes | Semantic search |
+| `meta-search "q" [--limit N]` | No | Zotero metadata search |
+| `get <key>` | No | Paper details |
+| `fulltext <key>` | No | Zotero full-text content |
+| `tags [--limit N]` | No | List all tags |
+| `collections` | No | List Zotero collections |
+| `build [--limit N] [--collection C]` | Yes | Build vector index |
+| `sync` | Yes | Add new papers to index |
+| `list [--limit N] [--offset N]` | No | Browse indexed papers |
+| `status` | No | Index statistics |
+| `ws-create <name>` | No | Create workspace |
+| `ws-list` | No | List workspaces |
+| `ws-show <name>` | No | Show workspace papers |
+| `ws-add <name> <keys>` | No | Add papers to workspace |
+| `ws-remove <name> <keys>` | No | Remove papers |
+| `ws-import <name> <collection>` | No | Import collection |
+| `ws-search <name> "q" [--rerank]` | Yes | Search within workspace |
+| `ws-delete <name>` | No | Delete workspace |
+| `delete [--force]` | No | Delete all data |

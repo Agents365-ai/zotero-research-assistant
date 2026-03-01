@@ -480,31 +480,85 @@ def cmd_list(limit=20, offset=0, sort_by="year"):
         print(f"\n  → Next page: list --offset {offset+limit}")
 
 def cmd_get(key: str):
-    """Get details of a specific paper from the index."""
-    if not (DATA_DIR / "meta.json").exists():
-        out("No index found. Run 'build' first.")
-        return
+    """Get full metadata for a paper (from Zotero API + index)."""
+    import requests
+    # Try Zotero API first for rich metadata
+    try:
+        r = requests.get(f"{ZOTERO_URL}/api/users/0/items/{key}", timeout=10)
+        r.raise_for_status()
+        d = r.json()["data"]
+        children_r = requests.get(f"{ZOTERO_URL}/api/users/0/items/{key}/children", timeout=10)
+        children = children_r.json() if children_r.ok else []
+        pdfs = []
+        for c in children:
+            if c["data"].get("contentType") == "application/pdf":
+                link = c.get("links", {}).get("enclosure", {})
+                path = urllib.parse.unquote(link.get("href", "").replace("file://", ""))
+                pdfs.append({"key": c["data"]["key"], "path": path})
 
-    db = get_db()
-    table = db.open_table(TABLE_NAME)
-    df = table.to_pandas()
-    matches = df[df["key"] == key].to_dict("records")
+        creators = ", ".join(c.get("lastName", c.get("name", "")) for c in d.get("creators", []))
+        tags = [t["tag"] for t in d.get("tags", [])]
+        result = {
+            "key": d["key"], "type": d["itemType"], "title": d.get("title", ""),
+            "creators": creators, "date": d.get("date", ""),
+            "abstract": d.get("abstractNote", ""), "tags": tags,
+            "DOI": d.get("DOI", ""), "url": d.get("url", ""),
+            "publication": d.get("publicationTitle", ""),
+            "pdfs": pdfs,
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    except:
+        # Fallback to index
+        if not (DATA_DIR / "meta.json").exists():
+            out(f"Paper '{key}' not found.")
+            return
+        db = get_db()
+        table = db.open_table(TABLE_NAME)
+        df = table.to_pandas()
+        matches = df[df["key"] == key].to_dict("records")
+        if not matches:
+            out(f"Paper '{key}' not found in index.")
+            return
+        paper = matches[0]
+        print(json.dumps({
+            "key": paper["key"], "title": paper["title"],
+            "authors": paper["authors"], "year": paper["year"],
+        }, ensure_ascii=False, indent=2))
 
-    if not matches:
-        out(f"Paper '{key}' not found in index.")
-        return
+def cmd_tags(limit=100):
+    """List all tags in Zotero library."""
+    items, _ = zotero_api("tags", {"limit": limit})
+    tags = [t["tag"] for t in items]
+    print(json.dumps(tags, ensure_ascii=False, indent=2))
 
-    paper = matches[0]
-    print(f"\n{'='*60}")
-    print(f"Key:     {paper['key']}")
-    print(f"Title:   {paper['title']}")
-    print(f"Authors: {paper['authors']}")
-    print(f"Year:    {paper['year']}")
-    print(f"{'='*60}")
-    text = paper.get("text", "")
-    if text:
-        print(f"\nText Preview:\n{text[:800]}...")
-    print()
+def cmd_fulltext(key: str):
+    """Get Zotero's indexed full-text content for a paper."""
+    children, _ = zotero_api(f"items/{key}/children")
+    for c in children:
+        if c["data"].get("contentType") == "application/pdf":
+            try:
+                ft, _ = zotero_api(f"items/{c['data']['key']}/fulltext")
+                content = ft.get("content", "")
+                if content:
+                    print(content[:5000])
+                    return
+            except:
+                pass
+    out(f"No full-text content found for '{key}'")
+
+def cmd_meta_search(query, limit=20):
+    """Search Zotero metadata (title/creator/tag) without vector index."""
+    items, _ = zotero_api("items", {"q": query, "limit": limit, "itemType": "-attachment"})
+    results = []
+    for it in items:
+        d = it["data"]
+        creators = ", ".join(c.get("lastName", c.get("name", "")) for c in d.get("creators", []))
+        results.append({
+            "key": d["key"], "type": d["itemType"], "title": d.get("title", ""),
+            "creators": creators, "date": d.get("date", ""),
+            "tags": [t["tag"] for t in d.get("tags", [])],
+        })
+    print(json.dumps(results, ensure_ascii=False, indent=2))
 
 # --- Workspace Commands ---
 
@@ -832,6 +886,16 @@ def main():
     p_get = sub.add_parser("get", help="Get paper details")
     p_get.add_argument("key", help="Paper key")
 
+    p_meta = sub.add_parser("meta-search", help="Search Zotero metadata (no vector index needed)")
+    p_meta.add_argument("query", help="Search query")
+    p_meta.add_argument("--limit", type=int, default=20, help="Max results")
+
+    p_tags = sub.add_parser("tags", help="List all Zotero tags")
+    p_tags.add_argument("--limit", type=int, default=100, help="Max tags")
+
+    p_fulltext = sub.add_parser("fulltext", help="Get Zotero full-text for a paper")
+    p_fulltext.add_argument("key", help="Paper key")
+
     sub.add_parser("ws-list", help="List workspaces")
 
     p_ws_create = sub.add_parser("ws-create", help="Create workspace")
@@ -881,6 +945,12 @@ def main():
         cmd_list(args.limit, args.offset, args.sort)
     elif args.cmd == "get":
         cmd_get(args.key)
+    elif args.cmd == "meta-search":
+        cmd_meta_search(args.query, args.limit)
+    elif args.cmd == "tags":
+        cmd_tags(args.limit)
+    elif args.cmd == "fulltext":
+        cmd_fulltext(args.key)
     elif args.cmd == "ws-list":
         cmd_ws_list()
     elif args.cmd == "ws-create":
